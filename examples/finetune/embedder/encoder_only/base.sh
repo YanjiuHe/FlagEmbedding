@@ -32,6 +32,7 @@ data_args="\
     --query_instruction_for_retrieval 'Represent this sentence for searching relevant passages: ' \
     --query_instruction_format '{}{}' \
     --knowledge_distillation False \
+    --candidate_pool ../example_data/retrieval/msmarco.jsonl \
 "
 
 training_args="\
@@ -52,9 +53,11 @@ training_args="\
     --sentence_pooling_method cls \
     --normalize_embeddings True \
     --kd_loss_type kl_div \
+    --dynamic_hn_mining \
+    --use_gpu_for_searching \
 "
 
-cmd="torchrun --nproc_per_node $num_gpus \
+cmd="python -m torch.distributed.run --nproc_per_node $num_gpus \
     -m FlagEmbedding.finetune.embedder.encoder_only.base \
     $model_args \
     $data_args \

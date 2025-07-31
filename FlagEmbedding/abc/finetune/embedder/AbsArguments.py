@@ -112,6 +112,15 @@ class AbsEmbedderDataArguments:
         default=0,
         metadata={"help": "The threshold for dropping merged small dataset. If the number of examples in the merged small dataset is less than this threshold, it will be dropped."}
     )
+    candidate_pool: Optional[str] = field(
+        default=None, metadata={"help": "The candidate pool for hard negative mining. If provided, it should be a jsonl file, each line is a dict with a key 'text'."}
+    )
+    range_for_sampling: str = field(
+        default="10-210", metadata={"help": "The range to sample negatives."}
+    )
+    negative_number: int = field(
+        default=15, metadata={"help": "The number of negatives."}
+    )
 
     def __post_init__(self):
         # replace "\\n" with "\n"
@@ -135,3 +144,5 @@ class AbsEmbedderTrainingArguments(TrainingArguments):
     normalize_embeddings: bool = field(default=True, metadata={"help": "whether to normalize the embeddings"})
     sub_batch_size: Optional[int] = field(default=None, metadata={"help": "sub batch size for training"})
     kd_loss_type: str = field(default='kl_div', metadata={"help": "the loss type for knowledge distillation. Available options: kl_div, m3_kd_loss. Default: kl_div.", "choices": ['kl_div', 'm3_kd_loss']})
+    dynamic_hn_mining: bool = field(default=False, metadata={"help": "Whether to use dynamic hard negative mining."})
+    use_gpu_for_searching: bool = field(default=False, metadata={"help": "Whether to use faiss-gpu for searching."})
