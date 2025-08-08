@@ -84,6 +84,6 @@ class EncoderOnlyEmbedderRunner(AbsEmbedderRunner):
 
         if self.training_args.dynamic_hn_mining:
             from FlagEmbedding.finetune.embedder.callback import DynamicHardNegativeMiningCallback
-            trainer.add_callback(DynamicHardNegativeMiningCallback(self.data_args, self.training_args))
+            trainer.add_callback(DynamicHardNegativeMiningCallback(self.data_args, self.training_args, self.tokenizer, trainer))
 
         return trainer

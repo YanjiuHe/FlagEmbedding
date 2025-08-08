@@ -1,8 +1,12 @@
 import json
 import random
 from typing import Optional
+import os
 
 import faiss
+import torch
+import torch_npu
+from torch_npu.contrib import transfer_to_npu
 import numpy as np
 from tqdm import tqdm
 
@@ -78,10 +82,10 @@ class HardNegativeMiner:
         else:
             corpus = list(set(corpus))
 
-        print(f'Inferencing embedding for corpus (number={len(corpus)})--------------')
-        p_vecs = self.model.encode(corpus)
         print(f'Inferencing embedding for queries (number={len(queries)})--------------')
-        q_vecs = self.model.encode_queries(queries)
+        q_vecs = self.model.encode_queries(queries=queries)
+        print(f'Inferencing embedding for corpus (number={len(corpus)})--------------')
+        p_vecs = self.model.encode(sentences=corpus)
 
         if isinstance(p_vecs, dict):
             p_vecs = p_vecs["dense_vecs"]

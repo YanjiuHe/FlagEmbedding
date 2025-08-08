@@ -114,6 +114,11 @@ class DecoderOnlyEmbedderRunner(AbsEmbedderRunner):
         )
         if self.data_args.same_dataset_within_batch:
             trainer.add_callback(EmbedderTrainerCallbackForDataRefresh(self.train_dataset))
+
+        if self.training_args.dynamic_hn_mining:
+            from FlagEmbedding.finetune.embedder.callback import DynamicHardNegativeMiningCallback
+            trainer.add_callback(DynamicHardNegativeMiningCallback(self.data_args, self.training_args, self.tokenizer, trainer))
+
         return trainer
 
     def run(self):
