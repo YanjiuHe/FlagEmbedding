@@ -825,7 +825,7 @@ class OnlineHardNegativeCollator:
             )
             q_inputs_on_device = {key: val.to(next(self.model.parameters()).device) for key, val in q_inputs.items()}
 
-            q_vecs = self.model.encode(q_inputs_on_device).cpu().numpy()
+            q_vecs = self.model.encode(q_inputs_on_device).cpu().numpy().astype(np.float32)
 
         # 恢复模型状态
         if was_training:
