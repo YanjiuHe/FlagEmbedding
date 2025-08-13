@@ -5,7 +5,7 @@ import logging
 import datasets
 import numpy as np
 import torch.distributed as dist
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from torch.utils.data import Dataset
 from transformers import (
     PreTrainedTokenizer, 
@@ -14,27 +14,32 @@ from transformers import (
     TrainerState,
     TrainerControl
 )
-
+import torch
+import json
+import faiss
+import threading
 from .AbsArguments import AbsEmbedderDataArguments, AbsEmbedderTrainingArguments
 
 logger = logging.getLogger(__name__)
 
 
 class AbsEmbedderTrainDataset(Dataset):
-    """Abstract class for training dataset.
-
-    Args:
-        args (AbsEmbedderDataArguments): Data arguments.
-        tokenizer (PreTrainedTokenizer): Tokenizer to use.
+    """
+    Abstract class for training dataset.
+    增加了对在线难负例挖掘模式的支持。
     """
     def __init__(
         self,
-        args: AbsEmbedderDataArguments,
-        tokenizer: PreTrainedTokenizer
+        args: "AbsEmbedderDataArguments", # 使用引号避免循环导入
+        tokenizer: PreTrainedTokenizer,
+        # === 新增参数 ===
+        online_mining: bool = False
     ):
         self.args = args
         self.tokenizer = tokenizer
         self.shuffle_ratio = args.shuffle_ratio
+        # === 新增属性 ===
+        self.online_mining = online_mining
 
         train_datasets = []
         for data_dir in args.train_data:
@@ -102,52 +107,84 @@ class AbsEmbedderTrainDataset(Dataset):
         return len(self.dataset)
 
     def __getitem__(self, item):
+        # 从 HF Dataset 获取原始数据字典，这一步是关键
         data = self.dataset[item]
-        train_group_size = self.args.train_group_size
 
-        query = data['query']
-        if self.args.query_instruction_for_retrieval is not None:
-            query = self.args.query_instruction_format.format(
-                data['prompt'] if 'prompt' in data else self.args.query_instruction_for_retrieval,
-                query
-            )
-
-        passages = []
-        teacher_scores = []
-
-        assert isinstance(data['pos'], list) and isinstance(data['neg'], list)
-
-        pos_idx = random.choice(list(range(len(data['pos']))))
-        passages.append(self._shuffle_text(data['pos'][pos_idx]))
-
-        neg_all_idx = list(range(len(data['neg'])))
-        if len(data['neg']) < train_group_size - 1:
-            num = math.ceil((train_group_size - 1) / len(data['neg']))
-            neg_idxs = random.sample(neg_all_idx * num, train_group_size - 1)
-        else:
-            neg_idxs = random.sample(neg_all_idx, self.args.train_group_size - 1)
-        for neg_idx in neg_idxs:
-            passages.append(data['neg'][neg_idx])
-
-        if self.args.knowledge_distillation:
-            assert isinstance(data['pos_scores'], list) and isinstance(data['neg_scores'], list)
-            teacher_scores.append(data['pos_scores'][pos_idx])
-            for neg_idx in neg_idxs:
-                teacher_scores.append(data['neg_scores'][neg_idx])
-            if not all(isinstance(score, (int, float)) for score in teacher_scores):
-                raise ValueError(f"pos_score or neg_score must be digit")
-        else:
-            teacher_scores = None
-
-        if self.args.passage_instruction_for_retrieval is not None:
-            passages = [
-                self.args.passage_instruction_format.format(
-                    self.args.passage_instruction_for_retrieval, p
+        # --- 如果是在线挖掘模式 ---
+        if self.online_mining:
+            # 在这种模式下，我们只提供 query 和 positives
+            # Collator 将负责挖掘 negatives
+            query = data['query']
+            # (可选) 应用 instruction
+            if self.args.query_instruction_for_retrieval is not None:
+                query = self.args.query_instruction_format.format(
+                    data.get('prompt', self.args.query_instruction_for_retrieval),
+                    query
                 )
-                for p in passages
-            ]
+            
+            positives = data['pos']
+            
+            # (可选) 应用 instruction
+            if self.args.passage_instruction_for_retrieval is not None:
+                positives = [
+                    self.args.passage_instruction_format.format(
+                        self.args.passage_instruction_for_retrieval, p
+                    ) for p in positives
+                ]
+            
+            # 返回一个字典，格式与 Collator 的期望严格对应
+            return {
+                "query": query,
+                "positives": positives
+            }
+        
+        # --- 如果是原始模式 (保持不变) ---
+        else:
+            train_group_size = self.args.train_group_size
 
-        return query, passages, teacher_scores
+            query = data['query']
+            if self.args.query_instruction_for_retrieval is not None:
+                query = self.args.query_instruction_format.format(
+                    data['prompt'] if 'prompt' in data else self.args.query_instruction_for_retrieval,
+                    query
+                )
+
+            passages = []
+            teacher_scores = []
+
+            assert isinstance(data['pos'], list) and isinstance(data['neg'], list)
+
+            pos_idx = random.choice(list(range(len(data['pos']))))
+            passages.append(self._shuffle_text(data['pos'][pos_idx]))
+
+            neg_all_idx = list(range(len(data['neg'])))
+            if len(data['neg']) < train_group_size - 1:
+                num = math.ceil((train_group_size - 1) / len(data['neg']))
+                neg_idxs = random.sample(neg_all_idx * num, train_group_size - 1)
+            else:
+                neg_idxs = random.sample(neg_all_idx, self.args.train_group_size - 1)
+            for neg_idx in neg_idxs:
+                passages.append(data['neg'][neg_idx])
+
+            if self.args.knowledge_distillation:
+                assert isinstance(data['pos_scores'], list) and isinstance(data['neg_scores'], list)
+                teacher_scores.append(data['pos_scores'][pos_idx])
+                for neg_idx in neg_idxs:
+                    teacher_scores.append(data['neg_scores'][neg_idx])
+                if not all(isinstance(score, (int, float)) for score in teacher_scores):
+                    raise ValueError(f"pos_score or neg_score must be digit")
+            else:
+                teacher_scores = None
+
+            if self.args.passage_instruction_for_retrieval is not None:
+                passages = [
+                    self.args.passage_instruction_format.format(
+                        self.args.passage_instruction_for_retrieval, p
+                    )
+                    for p in passages
+                ]
+
+            return query, passages, teacher_scores
 
 @dataclass
 class AbsEmbedderCollator(DataCollatorWithPadding):
@@ -620,3 +657,226 @@ class EmbedderTrainerCallbackForDataRefresh(TrainerCallback):
         Event called at the end of an epoch.
         """
         self.train_dataset.refresh_epoch()
+
+
+@dataclass
+class OnlineHardNegativeCollator:
+    tokenizer: PreTrainedTokenizer
+    model: torch.nn.Module
+    output_dir: str
+    query_max_len: int = 32
+    passage_max_len: int = 128
+    negative_number: int = 15
+    sample_range: str = "10-210"
+    use_gpu_for_searching: bool = False
+    
+    # 为多进程加载添加线程锁，防止重复加载
+    _lock = threading.Lock()
+    _current_index_path: str = field(init=False, default=None)
+    _lock: threading.Lock = field(init=False, default_factory=threading.Lock)
+
+    def __post_init__(self):
+        self.index = None
+        self.corpus: list[str] = []
+        self.sample_range_tup = [int(x) for x in self.sample_range.split('-')]
+        self.device = next(self.model.parameters()).device
+        self.meta_file_path = os.path.join(self.output_dir, "current_index.meta")
+
+    def update_index_for_new_epoch(self, epoch: int, output_dir: str):
+        # 这个方法不再直接加载，而是只更新路径
+        index_path = os.path.join(output_dir, f"corpus_index_epoch_{epoch}.faiss")
+        corpus_path = os.path.join(output_dir, f"corpus_texts_epoch_{epoch}.json")
+        
+        if os.path.exists(index_path) and os.path.exists(corpus_path):
+            print(f"[Collator Update] New index and corpus paths are set for epoch {epoch}.")
+            self._index_path = index_path
+            self._corpus_path = corpus_path
+            # 重置内部状态，强制下次调用时重新加载
+            self.index = None
+            self.corpus = []
+        else:
+            print(f"[Collator Update] WARN: Index/corpus for epoch {epoch} not found. Paths not updated.")
+    
+    def _ensure_index_is_loaded(self):
+        with self._lock:
+            # 1. 检查 meta 文件是否存在
+            if not os.path.exists(self.meta_file_path):
+                # 第一次调用时 meta 文件可能不存在，这很正常
+                return
+
+            # 2. 读取最新的路径信息
+            try:
+                with open(self.meta_file_path, 'r', encoding='utf-8') as f:
+                    latest_meta = json.load(f)
+                latest_index_path = latest_meta.get("index_path")
+            except (json.JSONDecodeError, FileNotFoundError):
+                # 文件可能正在被写入，暂时读取失败，下次再试
+                return
+
+            # 3. 检查当前加载的索引是否已是最新
+            if self._current_index_path == latest_index_path:
+                return  # 已经是最新了，无需操作
+
+            # 4. 加载新的索引
+            print(f"[Worker PID: {os.getpid()}] New index detected. Loading from {latest_index_path}")
+            try:
+                self.index = faiss.read_index(latest_index_path)
+                with open(latest_meta["corpus_path"], 'r', encoding='utf-8') as f:
+                    self.corpus = json.load(f)
+                
+                # 更新内部状态，记录当前已加载的路径
+                self._current_index_path = latest_index_path
+                print(f"[Worker PID: {os.getpid()}] Successfully loaded new index.")
+            except Exception as e:
+                print(f"[Worker PID: {os.getpid()}] ERROR loading new index: {e}")
+                # 加载失败，不更新 _current_index_path，下次会重试
+
+    def __call__(self, features: list[dict[str, any]]) -> dict[str, any]:
+        # `features` 是一个 batch 的数据, e.g., [{'query': q1, 'positives': [p1, p2]}, ...]
+        self._ensure_index_is_loaded()
+        queries = [f['query'] for f in features]
+        all_positives = [f['positives'] for f in features]
+
+        # 1. 准备 passages
+        # 遵循原版逻辑，每个query配一个positive和多个negative
+        final_passages = []
+        
+        self._ensure_index_is_loaded()
+        
+        if self.index is None:
+            # 只有在 _ensure_index_is_loaded 之后，index 仍然是 None
+            # 才打印警告，并且只打印一次
+            if not hasattr(self, '_initial_warned'):
+                print(f"[Worker PID: {os.getpid()}] WARN: Index not available. Using random negatives.")
+                self._initial_warned = True
+            hard_negatives = self._get_random_negatives([f['positives'] for f in features])
+        else:
+             hard_negatives = self._find_hard_negatives([f['query'] for f in features], [f['positives'] for f in features])
+
+        for i in range(len(queries)):
+            # 从positives列表中随机选一个
+            positive_passage = random.choice(all_positives[i])
+            final_passages.append(positive_passage)
+
+            # 获取挖掘到的或随机的负例
+            negs = hard_negatives[i]
+            
+            # 如果负例不够，用随机负例补充
+            if len(negs) < self.negative_number:
+                num_needed = self.negative_number - len(negs)
+                negs.extend(self._get_random_negatives_for_one_sample(all_positives[i], num_needed))
+            
+            final_passages.extend(negs)
+            
+        # 2. Tokenize, 模仿原始 Collator 的行为
+        queries_inputs = self.tokenizer(
+            queries,
+            padding=False, # 先不padding
+            truncation=True,
+            max_length=self.query_max_len,
+        )
+        passages_inputs = self.tokenizer(
+            final_passages,
+            padding=False,
+            truncation=True,
+            max_length=self.passage_max_len,
+        )
+
+        # 3. Pad, 模仿原始 Collator 的行为
+        q_collated = self.tokenizer.pad(
+            queries_inputs,
+            padding=True,
+            return_tensors='pt',
+        )
+        d_collated = self.tokenizer.pad(
+            passages_inputs,
+            padding=True,
+            return_tensors='pt',
+        )
+
+
+        target_device = next(self.model.parameters()).device
+
+        # 2. 将嵌套字典中的所有张量移动到目标设备
+        q_collated_on_device = {k: v.to(target_device) for k, v in q_collated.items()}
+        d_collated_on_device = {k: v.to(target_device) for k, v in d_collated.items()}
+
+        # 返回与原始Collator完全相同的格式
+        return {
+            "queries": q_collated_on_device,
+            "passages": d_collated_on_device,
+            "teacher_scores": None,  # 在这个方案中不处理知识蒸馏
+            "no_in_batch_neg_flag": False # 或者根据你的逻辑设置
+        }
+
+    def _find_hard_negatives(self, queries: list[str], all_positives: list[list[str]]) -> list[list[str]]:
+        # 切换模型到评估模式并禁用梯度
+
+
+        was_training = self.model.training
+        self.model.eval()
+        with torch.no_grad():
+            q_inputs = self.tokenizer(
+                queries, 
+                padding=True, 
+                truncation=True, 
+                return_tensors='pt', 
+                max_length=self.query_max_len
+            )
+            q_inputs_on_device = {key: val.to(next(self.model.parameters()).device) for key, val in q_inputs.items()}
+
+            q_vecs = self.model.encode(q_inputs_on_device).cpu().numpy()
+
+        # 恢复模型状态
+        if was_training:
+            self.model.train()
+
+        # 如果索引是空的，直接返回随机负例，避免在 index.search 崩溃
+        if self.index is None:
+            print("警告: 索引未加载，无法执行难负例搜索，将返回随机负例。")
+            return self._get_random_negatives(all_positives)
+
+        # 在索引中搜索
+        top_k = self.sample_range_tup[1]
+        _, all_inxs = self.index.search(q_vecs, k=top_k)
+
+        # ... (剩余的筛选逻辑保持不变) ...
+        batch_negatives = []
+        for i in range(len(queries)):
+            pos_set = set(all_positives[i])
+            query = queries[i]
+            inxs = all_inxs[i][self.sample_range_tup[0]:self.sample_range_tup[1]]
+            hard_negs = []
+            for inx in inxs:
+                if inx == -1: continue
+                candidate_text = self.corpus[inx]
+                if candidate_text != query and candidate_text not in pos_set:
+                    hard_negs.append(candidate_text)
+                if len(hard_negs) >= self.negative_number:
+                    break
+            batch_negatives.append(hard_negs)
+            
+        return batch_negatives
+
+    def _get_random_negatives(self, all_positives: list[list[str]]) -> list[list[str]]:
+        """为整个 batch 生成随机负例"""
+        batch_negatives = []
+        if not self.corpus:
+            # 极端情况：如果连语料库都没有，就返回空列表
+            return [[] for _ in all_positives]
+            
+        for positives in all_positives:
+            batch_negatives.append(self._get_random_negatives_for_one_sample(positives, self.negative_number))
+        return batch_negatives
+
+    def _get_random_negatives_for_one_sample(self, positives: list[str], num_to_get: int) -> list[str]:
+        """为一个样本生成随机负例"""
+        pos_set = set(positives)
+        negs = []
+        if not self.corpus: return negs
+        
+        while len(negs) < num_to_get:
+            rand_doc = random.choice(self.corpus)
+            if rand_doc not in pos_set:
+                negs.append(rand_doc)
+        return negs
